@@ -10,6 +10,7 @@ import { MspConnectionPairSolver } from "../MspConnectionPairSolver/MspConnectio
 import { SchematicTraceLinesSolver } from "../SchematicTraceLinesSolver/SchematicTraceLinesSolver"
 import { TraceOverlapShiftSolver } from "../TraceOverlapShiftSolver/TraceOverlapShiftSolver"
 import { NetLabelPlacementSolver } from "../NetLabelPlacementSolver/NetLabelPlacementSolver"
+import { NetLabelClearanceShiftSolver } from "../NetLabelClearanceShiftSolver/NetLabelClearanceShiftSolver"
 import { visualizeInputProblem } from "./visualizeInputProblem"
 import { GuidelinesSolver } from "../GuidelinesSolver/GuidelinesSolver"
 import { getInputChipBounds } from "../GuidelinesSolver/getInputChipBounds"
@@ -52,6 +53,7 @@ export class SchematicTracePipelineSolver extends BaseSolver {
   schematicTraceLinesSolver?: SchematicTraceLinesSolver
   traceOverlapShiftSolver?: TraceOverlapShiftSolver
   netLabelPlacementSolver?: NetLabelPlacementSolver
+  netLabelClearanceShiftSolver?: NetLabelClearanceShiftSolver
 
   startTimeOfPhase: Record<string, number>
   endTimeOfPhase: Record<string, number>
@@ -113,19 +115,25 @@ export class SchematicTracePipelineSolver extends BaseSolver {
       },
     ),
     definePipelineStep(
+      "netLabelClearanceShiftSolver",
+      NetLabelClearanceShiftSolver,
+      () => [
+        {
+          inputProblem: this.inputProblem,
+          inputTracePaths: this.schematicTraceLinesSolver!.solvedTracePaths,
+          // Pre-clearance phase: use declared net label sizes and approximate anchors
+          pendingNetLabels: this.derivePendingNetLabels(),
+        },
+      ],
+      { onSolved: () => {} },
+    ),
+    definePipelineStep(
       "netLabelPlacementSolver",
       NetLabelPlacementSolver,
       () => [
         {
           inputProblem: this.inputProblem,
-          inputTraceMap:
-            this.traceOverlapShiftSolver?.correctedTraceMap ??
-            Object.fromEntries(
-              this.schematicTraceLinesSolver!.solvedTracePaths.map((p) => [
-                p.mspPairId,
-                p,
-              ]),
-            ),
+          inputTraceMap: this.getTraceMapForNetLabels(),
         },
       ],
       {
@@ -200,6 +208,50 @@ export class SchematicTracePipelineSolver extends BaseSolver {
     this.timeSpentOnPhase[pipelineStepDef.solverName] = 0
     this.startTimeOfPhase[pipelineStepDef.solverName] = performance.now()
     this.firstIterationOfPhase[pipelineStepDef.solverName] = this.iterations
+  }
+
+  private getTraceMapForNetLabels() {
+    const baseMap = this.traceOverlapShiftSolver?.correctedTraceMap ??
+      Object.fromEntries(
+        this.schematicTraceLinesSolver!.solvedTracePaths.map((p) => [
+          p.mspPairId,
+          p,
+        ]),
+      )
+    if (this.netLabelClearanceShiftSolver?.correctedTraceMap) {
+      return this.netLabelClearanceShiftSolver.correctedTraceMap
+    }
+    return baseMap
+  }
+
+  private derivePendingNetLabels() {
+    // Approximate pre-placement rectangles near midpoints of each trace segment to pre-clear space
+    // Use default net label dimensions with orientation both ways; the clearance solver just needs bounds
+    const labels: Array<{ bounds: { minX: number; minY: number; maxX: number; maxY: number }; globalConnNetId: string }> = []
+    const WIDTH = 0.45
+    const HEIGHT = 0.2
+    const traces = this.schematicTraceLinesSolver?.solvedTracePaths ?? []
+    for (const t of traces) {
+      const pts = t.tracePath
+      for (let i = 0; i < pts.length - 1; i++) {
+        const a = pts[i]!
+        const b = pts[i + 1]!
+        const mid = { x: (a.x + b.x) / 2, y: (a.y + b.y) / 2 }
+        const isH = Math.abs(a.y - b.y) < 1e-6
+        const w = isH ? WIDTH : HEIGHT
+        const h = isH ? HEIGHT : WIDTH
+        labels.push({
+          globalConnNetId: t.globalConnNetId,
+          bounds: {
+            minX: mid.x - w / 2,
+            minY: mid.y - h / 2,
+            maxX: mid.x + w / 2,
+            maxY: mid.y + h / 2,
+          },
+        })
+      }
+    }
+    return labels
   }
 
   solveUntilPhase(phase: string) {
